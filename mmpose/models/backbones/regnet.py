@@ -3,12 +3,89 @@ import copy
 
 import numpy as np
 import torch.nn as nn
-from mmcv.cnn import build_conv_layer, build_norm_layer
+from collections import OrderedDict
+from mmcv.cnn import (build_conv_layer, build_norm_layer,
+                      constant_init, kaiming_init)
+from mmcv.runner.checkpoint import _load_checkpoint
+from mmcv.utils.parrots_wrapper import _BatchNorm
 
+from mmpose.utils import get_root_logger
 from ..builder import BACKBONES
 from .resnet import ResNet
 from .resnext import Bottleneck
+from .rsn import Upsample_unit
 
+
+class Upsample_module(nn.Module):
+    """Upsample module for RegNet, based on RSN.
+
+    Args:
+        unit_channels (int): Channel number in the upsample units.
+            Default:256.
+        num_units (int): Numbers of upsample units. Default: 4
+        widths (list[int]): Width in each stage. Default: [64, 128, 288, 672]
+        gen_skip (bool): Whether to generate skip for posterior downsample
+            module or not. Default:False
+        gen_cross_conv (bool): Whether to generate feature map for the next
+            hourglass-like module. Default:False
+        norm_cfg (dict): dictionary to construct and config norm layer.
+            Default: dict(type='BN')
+        out_channels (int): Number of channels of feature output by upsample
+            module. Must equal to in_channels of downsample module. Default:64
+    """
+
+    def __init__(self,
+                 unit_channels=256,
+                 num_units=4,
+                 stage_widths=list([64, 128, 288, 672]),
+                 gen_skip=False,
+                 gen_cross_conv=False,
+                 norm_cfg=dict(type='BN'),
+                 out_channels=64):
+        # Protect mutable default arguments
+        norm_cfg = copy.deepcopy(norm_cfg)
+        super().__init__()
+        assert len(stage_widths) == num_units
+        self.in_channels = copy.deepcopy(stage_widths)
+        self.in_channels.reverse()
+        self.num_units = num_units
+        self.gen_skip = gen_skip
+        self.gen_cross_conv = gen_cross_conv
+        self.norm_cfg = norm_cfg
+        for i in range(num_units):
+            module_name = f'up{i + 1}'
+            self.add_module(
+                module_name,
+                Upsample_unit(
+                    i,
+                    self.num_units,
+                    self.in_channels[i],
+                    unit_channels,
+                    self.gen_skip,
+                    self.gen_cross_conv,
+                    norm_cfg=self.norm_cfg,
+                    out_channels=64))
+
+    def forward(self, x):
+        out = list()
+        skip1 = list()
+        skip2 = list()
+        cross_conv = None
+        for i in range(self.num_units):
+            module_i = getattr(self, f'up{i + 1}')
+            if i == 0:
+                outi, skip1_i, skip2_i, _ = module_i(x[i], None)
+            elif i == self.num_units - 1:
+                outi, skip1_i, skip2_i, cross_conv = module_i(x[i], out[i - 1])
+            else:
+                outi, skip1_i, skip2_i, _ = module_i(x[i], out[i - 1])
+            out.append(outi)
+            skip1.append(skip1_i)
+            skip2.append(skip2_i)
+        skip1.reverse()
+        skip2.reverse()
+
+        return out, skip1, skip2, cross_conv
 
 @BACKBONES.register_module()
 class RegNet(ResNet):
@@ -190,9 +267,90 @@ class RegNet(ResNet):
             self.add_module(layer_name, res_layer)
             self.res_layers.append(layer_name)
 
+        self.upsample = Upsample_module(stage_widths=self.stage_widths)
         self._freeze_stages()
 
         self.feat_dim = stage_widths[-1]
+
+    def load_checkpoint(self, filename,
+                        map_location='cpu',
+                        logger=None):  
+        checkpoint = _load_checkpoint(filename, map_location)
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            state_dict = checkpoint
+
+        model_dict = self.state_dict()
+        model_layers_by_ind = OrderedDict((i, k) for (i, k) in enumerate(model_dict))
+        new_state_dict = OrderedDict()
+        matched_layers, discarded_layers, missing_layers = list(), list(), list()
+        
+        # Topological order of model and checkpoint layers is almost the same for non 'upsampling' / 'fc' layers
+        for (i, k) in enumerate(state_dict.keys()):
+            model_layer = model_layers_by_ind[i]
+            k_split = k.split('.')
+            if 'fc' in k_split[0]:
+                discarded_layers.append(k)
+                continue
+            if not model_dict[model_layer].shape == state_dict[k].shape:
+                # checkpoint layers order is shifted w.r.t model layers
+                if k_split[-3] == 'c' and k_split[-4] == 'f':
+                    k_split[-3] = 'a'
+                elif k_split[-3] == 'b' and k_split[-4] == 'f':
+                    k_split[-3] = 'c'
+                elif k_split[-3] == 'a' and k_split[-4] == 'f':
+                    k_split[-3] = 'b'
+                k = '.'.join(k_split)
+            if not model_dict[model_layer].shape == state_dict[k].shape:
+                discarded_layers.append(k)
+            else:
+                matched_layers.append(k)
+            new_state_dict[model_layer] = state_dict[k]        
+
+        missing_layers = [k for k in model_dict if k not in new_state_dict]
+        model_dict.update(new_state_dict)
+        self.load_state_dict(model_dict)
+
+        if len(matched_layers) == 0:
+            msg = f'The pretrained weights "{filename}" cannot be loaded, '\
+                'please check the key names manually '\
+                '(** ignored and continue **)'
+            logger.warning(msg)
+        else:
+            print('Successfully loaded pretrained weights\n')
+            msg = f'** the following layers are discarded: {", ".join(discarded_layers)}\n'
+            if len(discarded_layers) > 0:
+                logger.warning(msg)
+            msg = f'** missing layers in source state_dict: {", ".join(missing_layers)}\n'
+            if len(missing_layers) > 0:
+                logger.warning(msg)
+
+    def init_weights(self, pretrained=None):
+        """Initialize the weights in backbone.
+
+        Args:
+            pretrained (str, optional): Path to pre-trained weights.
+                Defaults to None.
+        """
+        if isinstance(pretrained, str):
+            logger = get_root_logger(log_level='INFO')
+            logger.info(f"Matching state_dict and model layers")
+            self.load_checkpoint(pretrained, logger=logger)
+        elif pretrained is None:
+            for m in self.modules():
+                if isinstance(m, nn.Conv2d):
+                    kaiming_init(m)
+                elif isinstance(m, _BatchNorm):
+                    constant_init(m, 1)
+
+            if self.zero_init_residual:
+                for m in self.modules():
+                    if isinstance(m, Bottleneck):
+                        constant_init(m.norm3, 0)
+        else:
+            raise TypeError('pretrained must be a str or None.'
+                            f' But received {type(pretrained)}.')
 
     def _make_stem_layer(self, in_channels, base_channels):
         self.conv1 = build_conv_layer(
@@ -314,4 +472,7 @@ class RegNet(ResNet):
 
         if len(outs) == 1:
             return outs[0]
-        return tuple(outs)
+        else:
+            outs.reverse()
+            outs, *_ = self.upsample(outs)
+            return [outs] # Only for single stage !
